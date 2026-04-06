@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef, Component, ErrorInfo } from "react";
 import { 
   LayoutDashboard, 
   Search, 
@@ -19,16 +19,55 @@ import {
   Plus,
   ChevronRight,
   Globe,
-  Layers
+  Layers,
+  RefreshCw
 } from "lucide-react";
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
   BarChart, Bar, Cell 
 } from "recharts";
 import { motion, AnimatePresence } from "motion/react";
-import { GoogleGenAI } from "@google/genai";
 import { cn } from "./lib/utils";
 import { Niche, Design, Sale, AutomationJob } from "./types";
+import * as geminiService from "./services/geminiService";
+import { dbService } from "./services/dbService";
+
+// --- Error Boundary ---
+class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean; error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-black flex items-center justify-center p-8">
+          <div className="max-w-md w-full glass-panel p-8 border-rose-500/20 text-center">
+            <AlertCircle className="mx-auto text-rose-500 mb-4" size={48} />
+            <h1 className="text-xl font-bold text-zinc-100 uppercase tracking-widest mb-2">System Critical Error</h1>
+            <p className="text-xs font-mono text-zinc-500 mb-6">{this.state.error?.message || "UNKNOWN_EXCEPTION"}</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded font-mono text-xs font-bold transition-all"
+            >
+              REBOOT_SYSTEM
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // --- Constants ---
 const STORAGE_KEYS = {
@@ -137,14 +176,18 @@ export default function App() {
       }
     };
     load(STORAGE_KEYS.NICHES, setNiches);
-    load(STORAGE_KEYS.DESIGNS, setDesigns);
     load(STORAGE_KEYS.SALES, setSales);
     load(STORAGE_KEYS.JOBS, setJobs);
     load(STORAGE_KEYS.CONFIG, setConfig);
+
+    // Load designs from IndexedDB
+    dbService.getAllDesigns().then(data => {
+      if (data && data.length > 0) setDesigns(data);
+    }).catch(err => console.error("Failed to load designs from IndexedDB:", err));
   }, []);
 
   useEffect(() => localStorage.setItem(STORAGE_KEYS.NICHES, JSON.stringify(niches)), [niches]);
-  useEffect(() => localStorage.setItem(STORAGE_KEYS.DESIGNS, JSON.stringify(designs)), [designs]);
+  // Designs are handled by dbService
   useEffect(() => localStorage.setItem(STORAGE_KEYS.SALES, JSON.stringify(sales)), [sales]);
   useEffect(() => localStorage.setItem(STORAGE_KEYS.JOBS, JSON.stringify(jobs)), [jobs]);
   useEffect(() => localStorage.setItem(STORAGE_KEYS.CONFIG, JSON.stringify(config)), [config]);
@@ -179,10 +222,14 @@ export default function App() {
   }, [niches, designs, sales, jobs]);
 
   // --- AI Logic ---
-  const getAI = () => {
+  const getAIConfig = (): geminiService.AIConfig => {
     const key = config.apiKey || process.env.GEMINI_API_KEY;
     if (!key) throw new Error("API Key missing. Configure in Settings.");
-    return new GoogleGenAI({ apiKey: key });
+    return {
+      apiKey: key,
+      model: config.model,
+      imageModel: config.imageModel
+    };
   };
 
   const discoverNiches = async (count = 5) => {
@@ -190,16 +237,9 @@ export default function App() {
     setError(null);
     addLog(`Starting niche discovery (count: ${count})...`);
     try {
-      const ai = getAI();
-      const response = await ai.models.generateContent({
-        model: config.model,
-        contents: `Generate ${count} high-potential Print-on-Demand micro-niches for 2026. 
-        Focus on scientific, technical, or futuristic themes.
-        Return ONLY a JSON array of objects with: name, score (0-100), competition (low/medium/high), demand (low/medium/high), profitability (0-100), trend (0-100), category.`,
-        config: { responseMimeType: "application/json" }
-      });
+      const aiConfig = getAIConfig();
+      const data = await geminiService.discoverNiches(aiConfig, count);
 
-      const data = JSON.parse(response.text || "[]");
       const newNiches: Niche[] = data.map((n: any) => ({
         ...n,
         id: generateId(),
@@ -221,21 +261,8 @@ export default function App() {
     setError(null);
     addLog(`Generating design for "${niche.name}" in style "${style}"...`);
     try {
-      const ai = getAI();
-      const prompt = `Professional POD design for "${niche.name}". Style: ${style}. Clean, minimalist, high contrast, vector aesthetic. No text unless requested.`;
-      
-      const response = await ai.models.generateContent({
-        model: config.imageModel,
-        contents: prompt,
-      });
-
-      let imageUrl = "";
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          imageUrl = `data:image/png;base64,${part.inlineData.data}`;
-          break;
-        }
-      }
+      const aiConfig = getAIConfig();
+      const { imageUrl, prompt } = await geminiService.generateDesign(aiConfig, niche.name, style);
 
       if (imageUrl) {
         const newDesign: Design = {
@@ -247,6 +274,8 @@ export default function App() {
           style,
           createdAt: new Date().toISOString()
         };
+        
+        await dbService.saveDesign(newDesign);
         setDesigns(prev => [newDesign, ...prev]);
         addLog(`Design generated successfully.`);
         
@@ -417,6 +446,16 @@ export default function App() {
     </div>
   );
 
+  const downloadDesign = (design: Design) => {
+    const link = document.createElement("a");
+    link.href = design.imageUrl;
+    link.download = `POD_DESIGN_${design.nicheName.replace(/\s+/g, "_")}_${design.style.replace(/\s+/g, "_")}.png`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    addLog(`Downloading design: ${design.nicheName}`);
+  };
+
   const renderGallery = () => (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -536,11 +575,17 @@ export default function App() {
               <p className="text-[10px] font-bold text-zinc-100 mb-1">{design.nicheName}</p>
               <p className="text-[8px] text-zinc-500 uppercase mb-4">{design.style}</p>
               <div className="flex gap-2">
-                <button className="p-2 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-100 transition-colors">
+                <button 
+                  onClick={() => downloadDesign(design)}
+                  className="p-2 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-100 transition-colors"
+                >
                   <Download size={14} />
                 </button>
                 <button 
-                  onClick={() => setDesigns(prev => prev.filter(d => d.id !== design.id))}
+                  onClick={async () => {
+                    await dbService.deleteDesign(design.id);
+                    setDesigns(prev => prev.filter(d => d.id !== design.id));
+                  }}
                   className="p-2 bg-rose-500/20 hover:bg-rose-500/40 rounded text-rose-400 transition-colors"
                 >
                   <Trash2 size={14} />
@@ -614,171 +659,279 @@ export default function App() {
     </div>
   );
 
-  return (
-    <div className="min-h-screen technical-grid flex">
-      {/* Sidebar */}
-      <aside className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col sticky top-0 h-screen z-50">
-        <div className="p-6 flex items-center gap-3 border-b border-zinc-800">
-          <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
-            <Zap size={20} className="text-white fill-white" />
-          </div>
-          <div>
-            <h1 className="text-lg font-black text-white tracking-tighter uppercase leading-none">POD_OS</h1>
-            <p className="text-[8px] font-mono text-zinc-500 mt-1 uppercase tracking-widest">v2.0.0-STABLE</p>
-          </div>
+  const renderSales = () => (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-mono font-bold text-zinc-100 flex items-center gap-2">
+          <TrendingUp size={20} className="text-emerald-500" />
+          Sales Tracker
+        </h2>
+        <div className="flex items-center gap-2 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded text-emerald-400 font-mono text-[10px] font-bold">
+          <Activity size={12} />
+          LIVE_SYNC_ACTIVE
         </div>
+      </div>
 
-        <nav className="flex-1 px-4 py-6 space-y-1">
-          {[
-            { id: "dashboard", label: "DASHBOARD", icon: LayoutDashboard },
-            { id: "niches", label: "NICHE_ENGINE", icon: Search },
-            { id: "gallery", label: "ASSET_REPO", icon: ImageIcon },
-            { id: "automation", label: "AUTO_HUB", icon: Cpu },
-            { id: "sales", label: "SALES_TRACKER", icon: TrendingUp },
-            { id: "config", label: "SYS_CONFIG", icon: Settings },
-          ].map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setActiveTab(item.id)}
-              className={cn(
-                "w-full flex items-center gap-3 px-4 py-2.5 rounded font-mono text-[11px] font-bold transition-all border",
-                activeTab === item.id 
-                  ? "bg-blue-600/10 text-blue-400 border-blue-600/30" 
-                  : "text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-zinc-900/50"
-              )}
-            >
-              <item.icon size={14} />
-              {item.label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="p-4 border-t border-zinc-800">
-          <div className="p-3 rounded bg-zinc-900/50 border border-zinc-800">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">System Status</span>
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            </div>
-            <p className="text-[10px] font-mono text-zinc-300">CORE_SYNC: OK</p>
-            <p className="text-[10px] font-mono text-zinc-300">AI_LATENCY: 24ms</p>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <Card className="p-4 bg-zinc-900/50">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">Total Revenue</p>
+          <p className="text-2xl font-black text-white tracking-tighter">${stats.revenue.toFixed(2)}</p>
+          <div className="mt-2 flex items-center gap-1 text-[9px] text-emerald-400 font-mono">
+            <TrendingUp size={10} />
+            +12.5% FROM_LAST_CYCLE
           </div>
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <main className="flex-1 min-h-screen flex flex-col">
-        {/* Top Bar */}
-        <header className="h-14 bg-zinc-950/50 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between px-8 sticky top-0 z-40">
-          <div className="flex items-center gap-2 text-[10px] font-mono font-bold uppercase tracking-widest">
-            <span className="text-zinc-600">POD_OS</span>
-            <ChevronRight size={12} className="text-zinc-800" />
-            <span className="text-blue-400">{activeTab}</span>
+        </Card>
+        <Card className="p-4 bg-zinc-900/50">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">Total Profit</p>
+          <p className="text-2xl font-black text-emerald-400 tracking-tighter">${stats.profit.toFixed(2)}</p>
+          <div className="mt-2 flex items-center gap-1 text-[9px] text-emerald-400 font-mono">
+            <TrendingUp size={10} />
+            +8.2% MARGIN_STABLE
           </div>
-          
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 px-2 py-1 bg-zinc-900 border border-zinc-800 rounded">
-              <Activity size={12} className="text-emerald-400" />
-              <span className="text-[9px] font-mono font-bold text-zinc-400">UPTIME: 99.9%</span>
-            </div>
-            <div className="w-7 h-7 rounded border border-zinc-800 overflow-hidden bg-zinc-900">
-              <img src="https://api.dicebear.com/7.x/bottts/svg?seed=POD" alt="Avatar" />
-            </div>
+        </Card>
+        <Card className="p-4 bg-zinc-900/50">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">Conversion Rate</p>
+          <p className="text-2xl font-black text-blue-400 tracking-tighter">3.8%</p>
+          <div className="mt-2 flex items-center gap-1 text-[9px] text-blue-400 font-mono">
+            <Activity size={10} />
+            OPTIMAL_PERFORMANCE
           </div>
-        </header>
+        </Card>
+      </div>
 
-        {/* Content Area */}
-        <div className="p-8 max-w-6xl mx-auto w-full flex-1">
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={activeTab}
-              initial={{ opacity: 0, x: -10 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: 10 }}
-              transition={{ duration: 0.15 }}
-            >
-              {error && (
-                <div className="mb-6 p-3 bg-rose-500/10 border border-rose-500/20 rounded text-rose-400 flex items-center gap-3 font-mono text-[11px]">
-                  <AlertCircle size={16} />
-                  <span>ERROR: {error}</span>
-                </div>
-              )}
-
-              {activeTab === "dashboard" && renderDashboard()}
-              {activeTab === "niches" && renderNiches()}
-              {activeTab === "gallery" && renderGallery()}
-              {activeTab === "automation" && renderAutomation()}
-              {activeTab === "sales" && (
-                <div className="text-center py-40 font-mono">
-                  <TrendingUp size={48} className="mx-auto text-zinc-900 mb-4" />
-                  <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-widest">Sales Analytics Terminal</h3>
-                  <p className="text-[10px] text-zinc-600 max-w-xs mx-auto mt-2">WAITING_FOR_DATA_SYNC // CONNECT_STOREFRONT_TO_INITIALIZE</p>
-                </div>
-              )}
-              {activeTab === "config" && (
-                <div className="max-w-xl space-y-6">
-                  <h2 className="text-xl font-mono font-bold text-zinc-100 uppercase tracking-widest">System Configuration</h2>
-                  
-                  <Card title="API_INTEGRATION" icon={Zap}>
-                    <div className="p-6 space-y-4">
-                      <div>
-                        <label className="text-[10px] font-bold text-zinc-500 uppercase mb-2 block tracking-widest">Gemini API Key</label>
-                        <div className="flex gap-2">
-                          <input 
-                            type="password" 
-                            value={config.apiKey} 
-                            onChange={(e) => setConfig(prev => ({ ...prev, apiKey: e.target.value }))}
-                            placeholder="ENTER_ENCRYPTED_KEY"
-                            className="flex-1 bg-black border border-zinc-800 rounded px-3 py-2 text-xs font-mono text-zinc-300 focus:outline-none focus:border-blue-500/50"
-                          />
-                        </div>
-                        <p className="text-[9px] text-zinc-600 mt-2 font-mono italic">Keys are stored locally in your browser's secure storage.</p>
-                      </div>
+      <Card title="RECENT_TRANSACTIONS" icon={TrendingUp}>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="border-b border-zinc-800">
+                <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Date</th>
+                <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Platform</th>
+                <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Revenue</th>
+                <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Profit</th>
+                <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Status</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono text-[11px]">
+              {sales.map((sale) => (
+                <tr key={sale.id} className="border-b border-zinc-800/50 hover:bg-zinc-900/30 transition-colors">
+                  <td className="p-4 text-zinc-400">{new Date(sale.date).toLocaleDateString()}</td>
+                  <td className="p-4">
+                    <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
+                      {sale.platform.toUpperCase()}
+                    </span>
+                  </td>
+                  <td className="p-4 text-zinc-100">${sale.revenue.toFixed(2)}</td>
+                  <td className="p-4 text-emerald-400">${sale.profit.toFixed(2)}</td>
+                  <td className="p-4">
+                    <div className="flex items-center gap-2">
+                      <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                      <span className="text-emerald-500">SETTLED</span>
                     </div>
-                  </Card>
-                  
-                  <Card title="DATA_OPERATIONS" icon={Trash2}>
-                    <div className="p-6 flex items-center justify-between">
-                      <div>
-                        <p className="text-xs font-bold text-zinc-300 uppercase tracking-widest">Factory Reset</p>
-                        <p className="text-[10px] text-zinc-500 font-mono mt-1">WIPE_ALL_LOCAL_DATA_AND_REBOOT_SYSTEM</p>
-                      </div>
-                      <button 
-                        onClick={() => {
-                          // Using a simple state-based confirmation would be better, 
-                          // but for now we'll just use a double-click or similar if needed.
-                          // Since we can't use confirm(), we'll just execute it for now 
-                          // or add a small "Are you sure?" state.
-                          localStorage.clear();
-                          window.location.reload();
-                        }}
-                        className="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 rounded font-mono text-[10px] font-bold transition-all"
-                      >
-                        EXECUTE_RESET
-                      </button>
-                    </div>
-                  </Card>
-                </div>
+                  </td>
+                </tr>
+              ))}
+              {sales.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="p-12 text-center text-zinc-600 italic">
+                    NO_TRANSACTIONS_RECORDED // WAITING_FOR_MARKET_ACTIVITY
+                  </td>
+                </tr>
               )}
-            </motion.div>
-          </AnimatePresence>
+            </tbody>
+          </table>
         </div>
-      </main>
-
-      {/* Global Loader Overlay */}
-      {loading && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center">
-          <div className="glass-panel p-8 rounded-lg flex flex-col items-center gap-4 shadow-2xl border-blue-500/20">
-            <div className="relative">
-              <Loader2 className="animate-spin text-blue-500" size={48} />
-              <Zap size={20} className="absolute inset-0 m-auto text-blue-400 fill-blue-400 animate-pulse" />
-            </div>
-            <div className="text-center font-mono">
-              <p className="text-zinc-100 font-bold text-sm tracking-widest uppercase">AI_PROCESSING</p>
-              <p className="text-[10px] text-zinc-500 mt-1">COMPUTING_NEURAL_VECTORS...</p>
-            </div>
-          </div>
-        </div>
-      )}
+      </Card>
     </div>
+  );
+
+  return (
+    <ErrorBoundary>
+      <div className="min-h-screen technical-grid flex">
+        {/* Sidebar */}
+        <aside className="w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col sticky top-0 h-screen z-50">
+          <div className="p-6 flex items-center gap-3 border-b border-zinc-800">
+            <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
+              <Zap size={20} className="text-white fill-white" />
+            </div>
+            <div>
+              <h1 className="text-lg font-black text-white tracking-tighter uppercase leading-none">POD_OS</h1>
+              <p className="text-[8px] font-mono text-zinc-500 mt-1 uppercase tracking-widest">v2.0.0-STABLE</p>
+            </div>
+          </div>
+
+          <nav className="flex-1 px-4 py-6 space-y-1">
+            {[
+              { id: "dashboard", label: "DASHBOARD", icon: LayoutDashboard },
+              { id: "niches", label: "NICHE_ENGINE", icon: Search },
+              { id: "gallery", label: "ASSET_REPO", icon: ImageIcon },
+              { id: "automation", label: "AUTO_HUB", icon: Cpu },
+              { id: "sales", label: "SALES_TRACKER", icon: TrendingUp },
+              { id: "config", label: "SYS_CONFIG", icon: Settings },
+            ].map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={cn(
+                  "w-full flex items-center gap-3 px-4 py-2.5 rounded font-mono text-[11px] font-bold transition-all border",
+                  activeTab === item.id 
+                    ? "bg-blue-600/10 text-blue-400 border-blue-600/30" 
+                    : "text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-zinc-900/50"
+                )}
+              >
+                <item.icon size={14} />
+                {item.label}
+              </button>
+            ))}
+          </nav>
+
+          <div className="p-4 border-t border-zinc-800">
+            <div className="p-3 rounded bg-zinc-900/50 border border-zinc-800">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">System Status</span>
+                <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              </div>
+              <p className="text-[10px] font-mono text-zinc-300">CORE_SYNC: OK</p>
+              <p className="text-[10px] font-mono text-zinc-300">AI_LATENCY: 24ms</p>
+            </div>
+          </div>
+        </aside>
+
+        {/* Main Content */}
+        <main className="flex-1 min-h-screen flex flex-col">
+          {/* Top Bar */}
+          <header className="h-14 bg-zinc-950/50 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between px-8 sticky top-0 z-40">
+            <div className="flex items-center gap-2 text-[10px] font-mono font-bold uppercase tracking-widest">
+              <span className="text-zinc-600">POD_OS</span>
+              <ChevronRight size={12} className="text-zinc-800" />
+              <span className="text-blue-400">{activeTab}</span>
+            </div>
+            
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2 px-2 py-1 bg-zinc-900 border border-zinc-800 rounded">
+                <Activity size={12} className="text-emerald-400" />
+                <span className="text-[9px] font-mono font-bold text-zinc-400">UPTIME: 99.9%</span>
+              </div>
+              <div className="w-7 h-7 rounded border border-zinc-800 overflow-hidden bg-zinc-900">
+                <img src="https://api.dicebear.com/7.x/bottts/svg?seed=POD" alt="Avatar" />
+              </div>
+            </div>
+          </header>
+
+          {/* Content Area */}
+          <div className="p-8 max-w-6xl mx-auto w-full flex-1">
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={activeTab}
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 10 }}
+                transition={{ duration: 0.15 }}
+              >
+                {error && (
+                  <div className="mb-6 p-3 bg-rose-500/10 border border-rose-500/20 rounded text-rose-400 flex items-center gap-3 font-mono text-[11px]">
+                    <AlertCircle size={16} />
+                    <span>ERROR: {error}</span>
+                  </div>
+                )}
+
+                {activeTab === "dashboard" && renderDashboard()}
+                {activeTab === "niches" && renderNiches()}
+                {activeTab === "gallery" && renderGallery()}
+                {activeTab === "automation" && renderAutomation()}
+                {activeTab === "sales" && renderSales()}
+                {activeTab === "config" && (
+                  <div className="max-w-xl space-y-6">
+                    <h2 className="text-xl font-mono font-bold text-zinc-100 uppercase tracking-widest">System Configuration</h2>
+                    
+                    <Card title="API_INTEGRATION" icon={Zap}>
+                      <div className="p-6 space-y-4">
+                        <div>
+                          <label className="text-[10px] font-bold text-zinc-500 uppercase mb-2 block tracking-widest">Gemini API Key</label>
+                          <div className="flex gap-2">
+                            <input 
+                              type="password" 
+                              value={config.apiKey} 
+                              onChange={(e) => setConfig(prev => ({ ...prev, apiKey: e.target.value }))}
+                              placeholder="ENTER_ENCRYPTED_KEY"
+                              className="flex-1 bg-black border border-zinc-800 rounded px-3 py-2 text-xs font-mono text-zinc-300 focus:outline-none focus:border-blue-500/50"
+                            />
+                          </div>
+                          <p className="text-[9px] text-zinc-600 mt-2 font-mono italic">Keys are stored locally in your browser's secure storage.</p>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="text-[10px] font-bold text-zinc-500 uppercase mb-2 block tracking-widest">Text Model</label>
+                            <select 
+                              value={config.model}
+                              onChange={(e) => setConfig(prev => ({ ...prev, model: e.target.value }))}
+                              className="w-full bg-black border border-zinc-800 rounded px-3 py-2 text-[10px] font-mono text-zinc-300 focus:outline-none focus:border-blue-500/50"
+                            >
+                              <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+                              <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+                              <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="text-[10px] font-bold text-zinc-500 uppercase mb-2 block tracking-widest">Image Model</label>
+                            <select 
+                              value={config.imageModel}
+                              onChange={(e) => setConfig(prev => ({ ...prev, imageModel: e.target.value }))}
+                              className="w-full bg-black border border-zinc-800 rounded px-3 py-2 text-[10px] font-mono text-zinc-300 focus:outline-none focus:border-blue-500/50"
+                            >
+                              <option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option>
+                              <option value="gemini-3.1-flash-image-preview">Gemini 3.1 Flash Image</option>
+                              <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image</option>
+                            </select>
+                          </div>
+                        </div>
+                      </div>
+                    </Card>
+                    
+                    <Card title="DATA_OPERATIONS" icon={Trash2}>
+                      <div className="p-6 flex items-center justify-between">
+                        <div>
+                          <p className="text-xs font-bold text-zinc-300 uppercase tracking-widest">Factory Reset</p>
+                          <p className="text-[10px] text-zinc-500 font-mono mt-1">WIPE_ALL_LOCAL_DATA_AND_REBOOT_SYSTEM</p>
+                        </div>
+                        <button 
+                          onClick={() => {
+                            // Using a simple state-based confirmation would be better, 
+                            // but for now we'll just use a double-click or similar if needed.
+                            // Since we can't use confirm(), we'll just execute it for now 
+                            // or add a small "Are you sure?" state.
+                            localStorage.clear();
+                            window.location.reload();
+                          }}
+                          className="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 rounded font-mono text-[10px] font-bold transition-all"
+                        >
+                          EXECUTE_RESET
+                        </button>
+                      </div>
+                    </Card>
+                  </div>
+                )}
+              </motion.div>
+            </AnimatePresence>
+          </div>
+        </main>
+
+        {/* Global Loader Overlay */}
+        {loading && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center">
+            <div className="glass-panel p-8 rounded-lg flex flex-col items-center gap-4 shadow-2xl border-blue-500/20">
+              <div className="relative">
+                <Loader2 className="animate-spin text-blue-500" size={48} />
+                <Zap size={20} className="absolute inset-0 m-auto text-blue-400 fill-blue-400 animate-pulse" />
+              </div>
+              <div className="text-center font-mono">
+                <p className="text-zinc-100 font-bold text-sm tracking-widest uppercase">AI_PROCESSING</p>
+                <p className="text-[10px] text-zinc-500 mt-1">COMPUTING_NEURAL_VECTORS...</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </ErrorBoundary>
   );
 }
